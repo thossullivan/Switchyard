@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use switchyard_llm_client::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
 use switchyard_protocol::RoutedLlmClient;
 use switchyard_server::config::load_server_state;
-use switchyard_server::{ServerState, build_switchyard_router};
+use switchyard_server::{ModelCapabilities, ServerState, build_switchyard_router};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -176,7 +176,13 @@ fn random_state(base_url: &str, routes: &[(&str, &[&str])]) -> TestResult<Server
                     .collect(),
             );
             let algorithm: Arc<dyn Algorithm> = Arc::new(Random::new(target_set, None, None)?);
-            Ok(((*route_model).to_string(), algorithm))
+            // These dispatch/stats tests declare no capability hints, so the route
+            // advertises null; the capability wiring is covered by config tests.
+            Ok((
+                (*route_model).to_string(),
+                algorithm,
+                ModelCapabilities::default(),
+            ))
         })
         .collect::<TestResult<Vec<_>>>()?;
     Ok(ServerState::new(entries)?)
@@ -864,6 +870,136 @@ async fn routes_dispatch_and_discovery_endpoints_are_stable() -> TestResult {
     let calls = upstream.calls.lock().await;
     assert_eq!(calls[0]["model"], "model/general");
     assert_eq!(calls[1]["model"], "model/code");
+    Ok(())
+}
+
+#[tokio::test]
+async fn models_endpoint_reports_declared_target_capabilities_and_null_when_undeclared()
+-> TestResult {
+    // Capabilities come from operator-declared per-target hints, aggregated across
+    // the tiers a route can answer from — never guessed from the route id or the
+    // model name. A route reports a field only when every serving tier declares
+    // it; a single undeclared tier makes the route report null. A classifier or
+    // stage-router judge target only scores, so it is left out of the aggregate.
+    const CONFIG: &str = r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[targets.deep]
+id = "nvidia/deepseek-ai/deepseek-v4-pro"
+llm_client = "primary"
+context_window = 1000000
+tool_calling = true
+
+[targets.claude]
+id = "anthropic/claude-haiku-4-5"
+llm_client = "primary"
+context_window = 200000
+tool_calling = true
+
+[targets.deep2]
+id = "nvidia/deepseek-ai/deepseek-v4"
+llm_client = "primary"
+context_window = 1000000
+tool_calling = true
+
+[targets.efficient]
+id = "moonshotai/kimi-k2"
+llm_client = "primary"
+context_window = 262000
+tool_calling = false
+
+[targets.bare]
+id = "vendor/undeclared-model"
+llm_client = "primary"
+
+[routes.random]
+id = "random"
+type = "random"
+targets = ["deep"]
+
+[routes.mixed]
+id = "mixed"
+type = "random"
+targets = ["deep", "claude"]
+
+[routes.classified]
+id = "classified"
+type = "llm_classifier"
+classifier_target = "claude"
+strong_target = "deep"
+weak_target = "deep2"
+base_threshold = 0.5
+
+[routes.staged]
+id = "staged"
+type = "stage_router"
+capable_target = "deep"
+efficient_target = "deep2"
+picker = "efficient_first"
+confidence_threshold = 0.5
+
+[routes.staged.classifier]
+target = "claude"
+base_threshold = 0.5
+
+[routes.restricted]
+id = "restricted"
+type = "passthrough"
+target = "efficient"
+
+[routes.undeclared]
+id = "undeclared"
+type = "passthrough"
+target = "bare"
+
+[routes.partial]
+id = "partial"
+type = "random"
+targets = ["deep", "bare"]
+"#;
+    let app = build_switchyard_router(load_test_config(CONFIG)?);
+    let models = send(&app, "GET", "/v1/models", None).await?;
+    assert_eq!(models.status, StatusCode::OK);
+    let body = models.json()?;
+    let data = body["data"].as_array().cloned().unwrap_or_default();
+    let capabilities = |route_id: &str| -> Value {
+        data.iter()
+            .find(|entry| entry["id"] == json!(route_id))
+            .map(|entry| entry["capabilities"].clone())
+            .unwrap_or(Value::Null)
+    };
+
+    // Single declared target → its declared window and tool calling.
+    assert_eq!(capabilities("random")["context_window"], json!(1_000_000));
+    assert_eq!(capabilities("random")["tool_calling"], json!(true));
+    // Multi-target route advertises the smallest declared window: min(1M, 200k).
+    assert_eq!(capabilities("mixed")["context_window"], json!(200_000));
+    // The judge target (claude) only scores; both serving tiers are DeepSeek (1M),
+    // so a wrongly-included judge would drop the advertised window to 200k.
+    assert_eq!(
+        capabilities("classified")["context_window"],
+        json!(1_000_000)
+    );
+    assert_eq!(capabilities("staged")["context_window"], json!(1_000_000));
+    // A tier that declares no tool calling makes the route report false — the flag
+    // is aggregated, not hardcoded true.
+    assert_eq!(capabilities("restricted")["context_window"], json!(262_000));
+    assert_eq!(capabilities("restricted")["tool_calling"], json!(false));
+    // A target with no declared hints reports null, not a guessed number. The
+    // `streaming` assertion proves the route entry is present, so the nulls below
+    // are a real "declared nothing", not a missing route.
+    assert_eq!(capabilities("undeclared")["streaming"], json!(true));
+    assert_eq!(capabilities("undeclared")["context_window"], json!(null));
+    assert_eq!(capabilities("undeclared")["tool_calling"], json!(null));
+    // One declared tier plus one undeclared tier → the route reports null; it never
+    // advertises the declared tier's window as if it covered the whole route.
+    assert_eq!(capabilities("partial")["streaming"], json!(true));
+    assert_eq!(capabilities("partial")["context_window"], json!(null));
+    assert_eq!(capabilities("partial")["tool_calling"], json!(null));
     Ok(())
 }
 

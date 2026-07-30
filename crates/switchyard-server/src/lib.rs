@@ -3,6 +3,7 @@
 
 //! Rust HTTP server for libsy algorithms.
 
+mod capabilities;
 pub mod config;
 mod metrics;
 mod observability;
@@ -47,6 +48,8 @@ use crate::stats::{StatsAccumulator, StatsSnapshot, prefix_probe, tracking_enabl
 
 pub use observability::{flush_observability, initialize_observability};
 
+pub use crate::capabilities::ModelCapabilities;
+
 /// Default TCP listen backlog used by the Rust server.
 pub const DEFAULT_LISTEN_BACKLOG: u32 = 65_535;
 
@@ -84,10 +87,18 @@ impl Error for ServerError {}
 /// Result returned by server setup and lifecycle operations.
 pub type ServerResult<T> = std::result::Result<T, ServerError>;
 
+/// A registered route: the libsy algorithm that serves it and the capabilities
+/// advertised for it on `GET /v1/models`. One entry owns both so the routing
+/// runtime and the model listing can never drift apart.
+struct RouteEntry {
+    algorithm: Arc<dyn Algorithm>,
+    capabilities: ModelCapabilities,
+}
+
 /// Shared server state used by all endpoint handlers.
 #[derive(Clone)]
 pub struct ServerState {
-    routes: Arc<BTreeMap<String, Arc<dyn Algorithm>>>,
+    routes: Arc<BTreeMap<String, RouteEntry>>,
     metrics: prometheus::Registry,
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
@@ -129,17 +140,22 @@ impl SharedRoutingLog {
 }
 
 impl ServerState {
-    /// Creates server state from route model IDs and their libsy algorithms.
+    /// Creates server state from route model IDs, their libsy algorithms, and the
+    /// capabilities advertised for each route on `GET /v1/models`.
     pub fn new(
-        routes: impl IntoIterator<Item = (String, Arc<dyn Algorithm>)>,
+        routes: impl IntoIterator<Item = (String, Arc<dyn Algorithm>, ModelCapabilities)>,
     ) -> ServerResult<Self> {
         let mut entries = BTreeMap::new();
-        for (model, algorithm) in routes {
+        for (model, algorithm, capabilities) in routes {
             let model = model.trim();
             if model.is_empty() {
                 return Err(ServerError::new("route model must not be empty"));
             }
-            if entries.insert(model.to_string(), algorithm).is_some() {
+            let entry = RouteEntry {
+                algorithm,
+                capabilities,
+            };
+            if entries.insert(model.to_string(), entry).is_some() {
                 return Err(ServerError::new(format!("duplicate route model {model}")));
             }
         }
@@ -167,8 +183,17 @@ impl ServerState {
         self.routes.keys().map(String::as_str)
     }
 
+    /// Returns each route model ID with the capabilities advertised for it.
+    fn model_entries(&self) -> impl Iterator<Item = (&str, ModelCapabilities)> {
+        self.routes
+            .iter()
+            .map(|(model, entry)| (model.as_str(), entry.capabilities))
+    }
+
     fn algorithm_for_model(&self, model: &str) -> Option<Arc<dyn Algorithm>> {
-        self.routes.get(model).map(Arc::clone)
+        self.routes
+            .get(model)
+            .map(|entry| Arc::clone(&entry.algorithm))
     }
 }
 
@@ -840,7 +865,7 @@ fn error_response(
 }
 
 async fn models(State(state): State<ServerState>) -> Json<Value> {
-    Json(model_list_payload(state.models()))
+    Json(model_list_payload(state.model_entries()))
 }
 
 async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {
@@ -920,13 +945,19 @@ async fn not_found() -> Response {
     )
 }
 
-fn model_list_payload<'a>(models: impl IntoIterator<Item = &'a str>) -> Value {
-    let model_ids = models.into_iter().map(str::to_string).collect::<Vec<_>>();
+fn model_list_payload<'a>(
+    entries: impl IntoIterator<Item = (&'a str, ModelCapabilities)>,
+) -> Value {
+    let entries = entries.into_iter().collect::<Vec<_>>();
+    let model_ids = entries
+        .iter()
+        .map(|(model, _)| model.to_string())
+        .collect::<Vec<_>>();
     let first_id = model_ids.first().cloned();
     let last_id = model_ids.last().cloned();
     json!({
         "object": "list",
-        "data": model_ids.iter().map(|model| model_entry_json(model)).collect::<Vec<_>>(),
+        "data": entries.iter().map(|(model, caps)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
         "first_id": first_id,
         "last_id": last_id,
         "has_more": false,
@@ -935,7 +966,7 @@ fn model_list_payload<'a>(models: impl IntoIterator<Item = &'a str>) -> Value {
     })
 }
 
-fn model_entry_json(model: &str) -> Value {
+fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
     json!({
         "id": model,
         "object": "model",
@@ -945,8 +976,8 @@ fn model_entry_json(model: &str) -> Value {
         "display_name": model,
         "capabilities": {
             "streaming": true,
-            "tool_calling": null,
-            "context_window": null,
+            "tool_calling": capabilities.tool_calling,
+            "context_window": capabilities.context_window,
             "supported_inbound_formats": [
                 "openai-chat-completions",
                 "openai-responses",
